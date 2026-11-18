@@ -1,0 +1,313 @@
+#!/usr/bin/env bash
+# qsw — switch which quickshell shell is running on this desktop.
+#
+# A "profile" is one installed shell, described by ~/.config/qsw/profiles/<name>.conf:
+#   DESC   one line shown in `qsw list` and the menu
+#   SLOT   config  = the shell reads ~/.config/quickshell and runs as `qs`
+#          none    = the shell lives elsewhere and runs as `quickshell -p <PATH>`
+#   PATH   the shell's own directory, for SLOT=none
+#   UNIT   optional systemd --user unit that starts/stops the shell itself
+#
+# Only one profile may occupy the SLOT. Switching parks the current occupant in
+# ~/.local/share/qsw/store/<name> and moves the new one into place, so nothing
+# is copied, symlinked or lost.
+set -uo pipefail
+
+CONFDIR="${XDG_CONFIG_HOME:-$HOME/.config}/qsw/profiles"
+STORE="${XDG_DATA_HOME:-$HOME/.local/share}/qsw/store"
+STATE="${XDG_STATE_HOME:-$HOME/.local/state}/qsw"
+SLOT="${XDG_CONFIG_HOME:-$HOME/.config}/quickshell"
+mkdir -p "$CONFDIR" "$STORE" "$STATE"
+
+die() { printf 'qsw: %s\n' "$*" >&2; exit 1; }
+say() { printf '%s\n' "$*"; }
+have() { command -v "$1" >/dev/null 2>&1; }
+
+pget() { # name key
+    local f="$CONFDIR/$1.conf"
+    [ -f "$f" ] || return 1
+    sed -n "s/^$2=//p" "$f" | head -1
+}
+names() { find "$CONFDIR" -maxdepth 1 -name '*.conf' -printf '%f\n' 2>/dev/null | sed 's/\.conf$//' | sort; }
+current() { cat "$STATE/current" 2>/dev/null || true; }
+
+# The profile that owns the slot in place, when no marker was written yet.
+infer_current() {
+    local n
+    [ -f "$SLOT/shell.qml" ] || return 1
+    for n in $(names); do
+        if [ "$(pget "$n" SLOT)" = config ] && [ ! -d "$STORE/$n" ]; then echo "$n"; return 0; fi
+    done
+    return 1
+}
+
+alive() { # pid of the shell started directly (not via a unit)
+    local p
+    if [ -f "$STATE/pid" ]; then
+        p=$(cat "$STATE/pid")
+        kill -0 "$p" 2>/dev/null && { echo "$p"; return 0; }
+    fi
+    return 1
+}
+
+# the pid(s) of the quickshell processes belonging to a profile — by exact
+# process name, never by cmdline pattern (that matches the caller's own shell)
+shell_pids() { # name
+    local n=$1 slot path unit p cmd found=()
+    slot=$(pget "$n" SLOT); path=$(pget "$n" PATH); unit=$(pget "$n" UNIT)
+    for p in $(pgrep -x quickshell 2>/dev/null) $(pgrep -x qs 2>/dev/null); do
+        cmd=$( { tr '\0' ' ' <"/proc/$p/cmdline"; } 2>/dev/null ) || continue
+        if [ -n "$path" ]; then
+            case "$cmd" in *"$path"*) found+=("$p") ;; esac
+        elif [ "$slot" = config ]; then
+            # a slot shell runs the default config: no -p and no -c on the line
+            case "$cmd" in *" -p "*|*" -c "*) ;; *" -d"*) found+=("$p") ;; esac
+        fi
+    done
+    if [ -n "$unit" ]; then
+        # a unit-launched shell: its supervisor is MainPID, the shell is its child
+        local mp
+        mp=$(systemctl --user show "$unit" -p MainPID --value 2>/dev/null)
+        if [ -n "$mp" ] && [ "$mp" != 0 ]; then
+            found+=("$mp")
+            for p in $(pgrep -P "$mp" 2>/dev/null); do found+=("$p"); done
+        fi
+    fi
+    [ ${#found[@]} -gt 0 ] && printf '%s\n' "${found[@]}"
+    return 0
+}
+
+stop_profile() { # name
+    local n=$1 unit p pid
+    unit=$(pget "$n" UNIT)
+    [ -n "$unit" ] && systemctl --user is-active --quiet "$unit" && systemctl --user stop "$unit" 2>/dev/null
+    for p in $(shell_pids "$n"); do kill "$p" 2>/dev/null; done
+    # helper daemons the shell spawned (clipboard watcher, stats, screentime)
+    for p in $(pgrep -x python3 2>/dev/null) $(pgrep -x wl-paste 2>/dev/null); do
+        case "$( { tr '\0' ' ' <"/proc/$p/cmdline"; } 2>/dev/null )" in
+            */quickshell/scripts/*) kill "$p" 2>/dev/null ;;
+        esac
+    done
+    if pid=$(alive); then kill "$pid" 2>/dev/null; fi
+    # give it a moment, then be firm
+    for _ in $(seq 1 30); do
+        [ -z "$(shell_pids "$n")" ] && [ -z "$(alive)" ] && break
+        sleep 0.1
+    done
+    for p in $(shell_pids "$n") $(alive); do kill -9 "$p" 2>/dev/null; done
+    rm -f "$STATE/pid"
+}
+
+park_slot() { # name of the profile that currently owns the slot
+    local occ=$1
+    [ -d "$SLOT" ] || return 0
+    if [ -e "$STORE/$occ" ]; then occ="$occ.$(date +%s)"; fi
+    mv "$SLOT" "$STORE/$occ" || die "could not park $SLOT"
+}
+
+claim_slot() { # name
+    local n=$1
+    if [ -d "$STORE/$n" ]; then
+        [ -d "$SLOT" ] && die "$SLOT is still there; refusing to overwrite it"
+        mv "$STORE/$n" "$SLOT" || die "could not move $STORE/$n into place"
+    fi
+    [ -f "$SLOT/shell.qml" ] || die "$SLOT has no shell.qml — profile $n is not installed"
+}
+
+wait_up() { # name
+    local n=$1 i
+    for i in $(seq 1 60); do
+        [ -n "$(shell_pids "$n")" ] && return 0
+        sleep 0.25
+    done
+    return 1
+}
+
+start_profile() { # name
+    local n=$1 slot path unit pid
+    slot=$(pget "$n" SLOT); path=$(pget "$n" PATH); unit=$(pget "$n" UNIT)
+    if [ -n "$(shell_pids "$n")" ]; then
+        # already up: adopt it instead of stacking a second copy on the screen
+        printf '%s\n' "$n" >"$STATE/current"
+        return 0
+    fi
+    if [ -n "$unit" ]; then
+        systemctl --user start "$unit" || die "could not start $unit"
+    elif [ "$slot" = config ]; then
+        ( setsid qs -d >/dev/null 2>&1 & echo $! >"$STATE/pid" )
+    elif [ -n "$path" ]; then
+        [ -f "$path/shell.qml" ] || [ -f "$path/Shell.qml" ] || die "$path has no shell entry point"
+        ( setsid quickshell -p "$path" -d >/dev/null 2>&1 & echo $! >"$STATE/pid" )
+    else
+        die "profile $n says nothing about how to start"
+    fi
+    wait_up "$n" || die "$n did not come up (see \`journalctl --user -t qs\`)"
+    pid=$(alive) || pid=${unit:-}
+    printf '%s\n' "$n" >"$STATE/current"
+    printf '%s\n' "pid=$pid" >"$STATE/last"
+}
+
+cmd_list() {
+    local n cur mark slot unit state
+    cur=$(current)
+    # nothing selected yet? whichever profile owns the slot is the live one
+    if [ -z "$cur" ] && [ -f "$SLOT/shell.qml" ]; then
+        for n in $(names); do
+            [ "$(pget "$n" SLOT)" = config ] && [ ! -d "$STORE/$n" ] && { cur=$n; break; }
+        done
+    fi
+    printf '%-16s %-9s %-30s %s\n' SHELL STATE WHERE LAUNCH
+    for n in $(names); do
+        slot=$(pget "$n" SLOT); unit=$(pget "$n" UNIT)
+        mark=""
+        [ "$n" = "$cur" ] && mark="*"
+        if [ "$slot" = config ]; then
+            if [ -d "$SLOT" ] && [ ! -d "$STORE/$n" ]; then state="in place"; else state="parked"; fi
+            where="$SLOT"
+        elif [ -n "$unit" ]; then
+            systemctl --user is-active --quiet "$unit" && state="running" || state="stopped"
+            where="systemd:$unit"
+        else
+            state=$( [ -n "$(shell_pids "$n")" ] && echo running || echo stopped )
+            where=$(pget "$n" PATH)
+        fi
+        printf '%-1s%-15s %-9s %-30s %s\n' "$mark" "$n" "$state" "$where" "${unit:-$(pget "$n" SLOT)}"
+    done
+    printf '\n%s\n' "* = last selected. switch with: qsw use <shell>   menu: qsw menu"
+}
+
+cmd_use() {
+    local n=$1 cur slot layers
+    [ -n "$n" ] || die "usage: qsw use <shell>   (one of: $(names | tr '\n' ' '))"
+    [ -f "$CONFDIR/$n.conf" ] || die "no such shell: $n"
+    cur=$(current)
+    [ -z "$cur" ] && cur=$(infer_current)
+    slot=$(pget "$n" SLOT)
+    if [ "$cur" = "$n" ] && [ -n "$(shell_pids "$n")" ]; then
+        say "$n is already running."
+        return 0
+    fi
+    [ -n "$cur" ] && stop_profile "$cur"
+    if [ "$slot" = config ] && { [ ! -d "$SLOT" ] || [ -d "$STORE/$n" ]; }; then
+        [ -d "$SLOT" ] && park_slot "${cur:-unmanaged}"
+        claim_slot "$n"
+    fi
+    start_profile "$n"
+    say "switched to $n"
+    if have hyprctl && [ -n "${HYPRLAND_INSTANCE_SIGNATURE:-}" ]; then
+        # wait for the new shell's layer surfaces, not just its process
+        for _ in $(seq 1 20); do
+            layers=$(hyprctl layers 2>/dev/null | grep -o 'namespace: [a-z-]*' | sed 's/namespace: //' | sort -u | tr '\n' ' ')
+            case "$layers" in *awww*|"") sleep 0.4 ;; *) break ;; esac
+        done
+        printf '%s\n' "layers now: $layers"
+    fi
+}
+
+cmd_stop() {
+    local cur; cur=$(current)
+    [ -n "$cur" ] || die "nothing to stop"
+    stop_profile "$cur"
+    say "stopped $cur"
+}
+
+cmd_start() {
+    local n=${1:-$(current)}
+    [ -n "$n" ] || die "usage: qsw start <shell>"
+    start_profile "$n"
+    say "started $n"
+}
+
+cmd_restore() {
+    # run at login: Hyprland's autostart always brings up the slot shell, so put
+    # back whichever one qsw was last switched to, and clear the imposter if the
+    # session started the wrong one
+    local n mine others=() p
+    n=$(current)
+    [ -n "$n" ] || { say "no shell selected yet — leaving the default up"; return 0; }
+    mine=$(shell_pids "$n")
+    for p in $(pgrep -x quickshell 2>/dev/null) $(pgrep -x qs 2>/dev/null); do
+        case " $mine " in *" $p "*) ;; *) others+=("$p") ;; esac
+    done
+    if [ -n "$mine" ] && [ ${#others[@]} -eq 0 ]; then say "$n is already up"; return 0; fi
+    for p in "${others[@]}"; do
+        say "clearing pid $p, which is not $n"
+        kill "$p" 2>/dev/null
+    done
+    [ ${#others[@]} -gt 0 ] && sleep 2
+    cmd_use "$n"
+}
+
+cmd_add() { # name path [--slot] [--unit UNIT]
+    local n=$1 p=$2 slot=none unit= desc=""
+    shift 2 || die "usage: qsw add <name> <path> [--slot] [--unit UNIT] [--desc TEXT]"
+    while [ $# -gt 0 ]; do
+        case "$1" in
+            --slot) slot=config ;;
+            --unit) unit=$2; shift ;;
+            --desc) desc=$2; shift ;;
+            *) die "unknown option: $1" ;;
+        esac
+        shift
+    done
+    [ -n "$n" ] && [ -n "$p" ] || die "usage: qsw add <name> <path> [--slot] [--unit UNIT]"
+    [ -d "$p" ] || die "no such directory: $p"
+    mkdir -p "$CONFDIR"
+    {
+        echo "DESC=${desc:-$n}"
+        echo "SLOT=$slot"
+        [ "$slot" = none ] && echo "PATH=$p"
+        [ -n "$unit" ] && echo "UNIT=$unit"
+    } >"$CONFDIR/$n.conf"
+    say "registered $n ($slot${unit:+, $unit})"
+}
+
+cmd_menu() {
+    local pick n
+    have fuzzel || die "fuzzel is not installed"
+    pick=$(for n in $(names); do printf '%s\t%s\n' "$n" "$(pget "$n" DESC)"; done \
+        | fuzzel --dmenu --prompt='shell > ' --with-nth=1,2 2>/dev/null) || exit 0
+    [ -n "$pick" ] || exit 0
+    n=${pick%%$'\t'*}
+    cmd_use "$n"
+}
+
+cmd_discover() {
+    # register what is installed here, without touching anything
+    if [ -f "$SLOT/shell.qml" ] && grep -q 'impasto' "$SLOT/shell.qml" 2>/dev/null; then
+        printf 'DESC=Impasto — island bar, dock, desktop widgets\nSLOT=config\n' >"$CONFDIR/impasto.conf"
+    fi
+    local sp="$HOME/.local/share/serpantinum/src/quickshell"
+    if [ -f "$sp/Shell.qml" ]; then
+        printf 'DESC=Serpantinum — the stock fork shell\nSLOT=none\nPATH=%s\nUNIT=serpantinum-shell.service\n' "$sp" \
+            >"$CONFDIR/serpantinum.conf"
+    fi
+    say "registered: $(names | tr '\n' ' ')"
+}
+
+usage() {
+    cat <<'EOF'
+qsw — switch the quickshell shell running on this desktop
+
+  qsw list                 the shells known here, and which one is live
+  qsw use <shell>          swap to it (parks the current one, starts the new one)
+  qsw menu                 pick one in fuzzel
+  qsw stop | start [shell] stop / start the current shell
+  qsw discover             re-register the shells installed on this machine
+  qsw add <name> <path> [--slot] [--unit UNIT] [--desc TEXT]
+                           register another shell by hand
+EOF
+}
+
+case "${1:-}" in
+    list|ls)      cmd_list ;;
+    use)          shift; cmd_use "${1:-}" ;;
+    menu)         cmd_menu ;;
+    stop)         cmd_stop ;;
+    restore)      cmd_restore ;;
+    start)        shift; cmd_start "${1:-}" ;;
+    discover)     cmd_discover ;;
+    add)          shift; cmd_add "$@" ;;
+    ''|-h|--help|help) usage ;;
+    *)            die "unknown command: $1 (try qsw --help)" ;;
+esac
