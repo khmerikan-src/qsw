@@ -97,6 +97,17 @@ hl.bind("SUPER + SHIFT + Y", hl.dsp.exec_cmd("qsw menu"), {
 })
 ```
 
+**The session `PATH` usually has no `~/.local/bin`**, and a keybind whose command
+is not found fails silently — the bind fires, nothing happens, no error in the
+log. Either give the bind an absolute path or add the directory to the session
+environment; `examples/custom-env.lua` does the latter for impasto's layout:
+
+```lua
+if not path:find(home .. "/.local/bin", 1, true) then
+    hl.env("PATH", home .. "/.local/bin:" .. path)
+end
+```
+
 ## Where things live
 
 | path | contents |
