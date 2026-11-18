@@ -115,3 +115,7 @@ hl.bind("SUPER + SHIFT + Y", hl.dsp.exec_cmd("qsw menu"), {
   and the store live under `$HOME`, so the move is a rename and is instant.
 - It only manages the shell process; wallpaper daemons, notification daemons and
   anything else your session starts are left alone.
+
+## License
+
+MIT — see [LICENSE](LICENSE).
